@@ -10,9 +10,22 @@
 		7F6E697C2DB1B6FC00EB56D9 /* fader-scroller.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "fader-scroller.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		7F6E698F2DB1B94100EB56D9 /* Exceptions for "fader-scroller" folder in "fader-scroller" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 7F6E697B2DB1B6FC00EB56D9 /* fader-scroller */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		7F6E697E2DB1B6FC00EB56D9 /* fader-scroller */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				7F6E698F2DB1B94100EB56D9 /* Exceptions for "fader-scroller" folder in "fader-scroller" target */,
+			);
 			path = "fader-scroller";
 			sourceTree = "<group>";
 		};
@@ -257,6 +270,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "fader-scroller/Info.plist";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -284,6 +298,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "fader-scroller/Info.plist";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
