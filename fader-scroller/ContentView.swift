@@ -8,10 +8,11 @@
 import SwiftUI
 import Cocoa
 import ApplicationServices
+import CoreGraphics
 
 struct ContentView: View {
     // Add a timer that fires every second
-    // let timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
+    let timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
     @State private var scrollMonitor: ScrollWheelMonitor?
 
     var body: some View {
@@ -26,8 +27,15 @@ struct ContentView: View {
         }
         .padding()
         .onAppear {
-            scrollMonitor = ScrollWheelMonitor { deltaY in
-                handleScroll(deltaY: deltaY)
+            scrollMonitor = ScrollWheelMonitor { deltaY, slider in
+                _ = getSliderLabel(slider) ?? "(no label)"
+                let action = deltaY > 0 ? kAXIncrementAction as String : kAXDecrementAction as String
+                let scrollMagnitude = min(abs(deltaY), 30.0)
+                let scaledActions = Int(scrollMagnitude * 0.25)
+                let numActions = max(1, scaledActions)
+                for _ in 0..<numActions {
+                    _ = AXUIElementPerformAction(slider, action as CFString)
+                }
             }
         }
         .onDisappear {
@@ -35,7 +43,7 @@ struct ContentView: View {
             scrollMonitor = nil
         }
         .onReceive(timer) { _ in
-            logElementUnderMouse()
+            // logElementUnderMouse()
         }
     }
 }
@@ -44,30 +52,27 @@ func checkAccessibilityPermission() -> Bool {
     return AXIsProcessTrusted()
 }
 
-func logElementUnderMouse() {
-    let mouseLocation = NSEvent.mouseLocation
-    guard let screen = NSScreen.screens.first else { return }
-    let point = CGPoint(x: mouseLocation.x, y: screen.frame.height - mouseLocation.y)
+// func logElementUnderMouse() {
+//     let mouseLocation = NSEvent.mouseLocation
+//     guard let screen = NSScreen.screens.first else { return }
+//     let point = CGPoint(x: mouseLocation.x, y: screen.frame.height - mouseLocation.y)
 
-    let systemWideElement = AXUIElementCreateSystemWide()
-    var element: AXUIElement?
-    let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(point.x), Float(point.y), &element)
-    if result == .success, let element = element {
-        let sliders = findAllSliders(element)
-        if sliders.isEmpty {
-            print("No sliders under mouse.")
-        } else if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
-            let label = getSliderLabel(slider) ?? "(no label)"
-            print("Slider under mouse: \(label)")
-            // printAvailableActions(for: slider)
-            // printAllAttributes(for: slider)
-        } else {
-            print("No slider directly under mouse (but found \(sliders.count) in subtree).")
-        }
-    } else {
-        print("Could not get accessibility element under mouse.")
-    }
-}
+//     let systemWideElement = AXUIElementCreateSystemWide()
+//     var element: AXUIElement?
+//     let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(point.x), Float(point.y), &element)
+//     if result == .success, let element = element {
+//         let sliders = findAllSliders(element)
+//         if sliders.isEmpty {
+//             // No sliders under mouse.
+//         } else if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
+//             // Slider under mouse found.
+//         } else {
+//             // No slider directly under mouse (but found some in subtree).
+//         }
+//     } else {
+//         // Could not get accessibility element under mouse.
+//     }
+// }
 
 func findSliderElement(_ element: AXUIElement, depth: Int = 0) -> AXUIElement? {
     var role: CFTypeRef?
@@ -146,43 +151,27 @@ func findSliderUnderMouse(_ sliders: [AXUIElement], mousePoint: CGPoint) -> AXUI
     return nil
 }
 
-func handleScroll(deltaY: CGFloat) {
-    let mouseLocation = NSEvent.mouseLocation
-    guard let screen = NSScreen.screens.first else { return }
-    let point = CGPoint(x: mouseLocation.x, y: screen.frame.height - mouseLocation.y)
-
-    let systemWideElement = AXUIElementCreateSystemWide()
-    var element: AXUIElement?
-    let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(point.x), Float(point.y), &element)
-    if result == .success, let element = element {
-        let sliders = findAllSliders(element)
-        if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
-
-            // Determine direction
-            let action = deltaY > 0 ? "AXIncrement" : "AXDecrement"
-
-            // Linear scaling with a reasonable maximum
-            let scrollMagnitude = min(abs(deltaY), 30.0) // Cap maximum scroll speed
-            let scaledActions = Int(scrollMagnitude * 0.5) // Adjust this multiplier to tune sensitivity
-
-            // Ensure at least one action for intentional scrolls
-            let numActions = max(1, scaledActions)
-
-            // Perform actions with consistent timing
-            for _ in 0..<numActions {
-                // performSliderAction(slider, action: action)
-                AXUIElementPerformAction(slider, action as CFString)
-            }
-        }
+// Helper function to get the parent of an element
+func getParentElement(_ element: AXUIElement) -> AXUIElement? {
+    var parent: CFTypeRef?
+    if AXUIElementCopyAttributeValue(element, kAXParentAttribute as CFString, &parent) == .success {
+        return (parent as! AXUIElement?)
     }
+    return nil
 }
 
 class ScrollWheelMonitor: Hashable {
-    private var monitor: Any?
+    private var eventTap: CFMachPort?
+    private var runLoopSource: CFRunLoopSource?
     private static var activeMonitors: Set<ScrollWheelMonitor> = []
-    private let id = UUID() // Add a unique identifier
+    private let id = UUID()
+    private let onScroll: (CGFloat, AXUIElement) -> Void
 
-    // Add Hashable conformance
+    // --- Optimization: Cache the last targeted slider ---
+    private var cachedSlider: AXUIElement?
+    private var cacheTimestamp: Date?
+    private let cacheTimeout: TimeInterval = 0.3 // Invalidate cache after 0.3 seconds of inactivity
+
     static func == (lhs: ScrollWheelMonitor, rhs: ScrollWheelMonitor) -> Bool {
         return lhs.id == rhs.id
     }
@@ -191,21 +180,118 @@ class ScrollWheelMonitor: Hashable {
         hasher.combine(id)
     }
 
-    init(onScroll: @escaping (CGFloat) -> Void) {
-        monitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { event in
-            onScroll(event.scrollingDeltaY)
-        }
-        if let _ = monitor {
-            ScrollWheelMonitor.activeMonitors.insert(self)
+    init(onScroll: @escaping (CGFloat, AXUIElement) -> Void) {
+        self.onScroll = onScroll
+        setupEventTap()
+        ScrollWheelMonitor.activeMonitors.insert(self)
+    }
+
+    private func invalidateCache() {
+        // Helper to clear cache
+        cachedSlider = nil
+        cacheTimestamp = nil
+    }
+
+    private func setupEventTap() {
+        let selfPtr = UnsafeMutableRawPointer(Unmanaged.passRetained(self).toOpaque())
+
+        eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(1 << CGEventType.scrollWheel.rawValue),
+            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                guard let refcon = refcon else {
+                    return Unmanaged.passRetained(event)
+                }
+                let monitor = Unmanaged<ScrollWheelMonitor>.fromOpaque(refcon).takeUnretainedValue()
+
+                if type == .scrollWheel {
+                    let deltaY = event.getDoubleValueField(.scrollWheelEventDeltaAxis1)
+                    guard deltaY != 0.0 else {
+                        return Unmanaged.passRetained(event)
+                    }
+
+                    let mouseLocation = NSEvent.mouseLocation
+                    guard let screen = NSScreen.screens.first else {
+                        monitor.invalidateCache()
+                        return Unmanaged.passRetained(event)
+                    }
+                    let point = CGPoint(x: mouseLocation.x, y: screen.frame.height - mouseLocation.y)
+                    let now = Date()
+
+                    if let cached = monitor.cachedSlider,
+                       let lastCacheTime = monitor.cacheTimestamp,
+                       now.timeIntervalSince(lastCacheTime) < monitor.cacheTimeout {
+                        if let frame = getSliderFrame(cached), frame.contains(point) {
+                            monitor.cacheTimestamp = now
+                            DispatchQueue.main.async {
+                                monitor.onScroll(deltaY, cached)
+                            }
+                            return nil
+                        } else {
+                            monitor.invalidateCache()
+                        }
+                    } else if monitor.cachedSlider != nil {
+                        monitor.invalidateCache()
+                    }
+
+                    let systemWideElement = AXUIElementCreateSystemWide()
+                    var elementUnderMouse: AXUIElement?
+                    let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(point.x), Float(point.y), &elementUnderMouse)
+
+                    if result == .success, let element = elementUnderMouse {
+                        var targetSlider: AXUIElement? = nil
+                        var searchElement: AXUIElement? = element
+
+                        for _ in 0..<3 {
+                            guard let currentSearchElement = searchElement else { break }
+                            let sliders = findAllSliders(currentSearchElement)
+                            if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
+                                targetSlider = slider
+                                break
+                            }
+                            searchElement = getParentElement(currentSearchElement)
+                        }
+
+                        if let slider = targetSlider {
+                            monitor.cachedSlider = slider
+                            monitor.cacheTimestamp = now
+                            DispatchQueue.main.async {
+                                monitor.onScroll(deltaY, slider)
+                            }
+                            return nil
+                        } else {
+                            monitor.invalidateCache()
+                        }
+                    } else {
+                        monitor.invalidateCache()
+                    }
+                }
+                return Unmanaged.passRetained(event)
+            },
+            userInfo: selfPtr)
+
+        if let eventTap = eventTap {
+            runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
+            if let runLoopSource = runLoopSource {
+                CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+                CGEvent.tapEnable(tap: eventTap, enable: true)
+            }
         }
     }
 
     func cleanup() {
-        if let monitor = monitor {
-            NSEvent.removeMonitor(monitor)
-            ScrollWheelMonitor.activeMonitors.remove(self)
-            self.monitor = nil
+        invalidateCache()
+        if let runLoopSource = runLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         }
+        if let eventTap = eventTap {
+            CGEvent.tapEnable(tap: eventTap, enable: false)
+        }
+        runLoopSource = nil
+        eventTap = nil
+        ScrollWheelMonitor.activeMonitors.remove(self)
     }
 
     deinit {
@@ -219,32 +305,6 @@ class ScrollWheelMonitor: Hashable {
         activeMonitors.removeAll()
     }
 }
-
-// func printAvailableActions(for element: AXUIElement) {
-//     var actionsValue: CFTypeRef?
-//     if AXUIElementCopyAttributeValue(element, "AXActions" as CFString, &actionsValue) == .success,
-//        let actions = actionsValue as? [String] {
-//         print("Available actions for element:")
-//         for action in actions {
-//             print(" - \(action)")
-//         }
-//     } else {
-//         print("No actions available for this element.")
-//     }
-// }
-
-// func printAllAttributes(for element: AXUIElement) {
-//     var names: CFArray?
-//     let result = AXUIElementCopyAttributeNames(element, &names)
-//     if result == .success, let names = names as? [String] {
-//         print("Available attributes for element:")
-//         for attr in names {
-//             print(" - \(attr)")
-//         }
-//     } else {
-//         print("No attributes available for this element.")
-//     }
-// }
 
 #Preview {
     ContentView()
