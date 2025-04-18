@@ -14,6 +14,7 @@ struct ContentView: View {
     // Add a timer that fires every second
     let timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
     @State private var scrollMonitor: ScrollWheelMonitor?
+    @State private var isPolarityReversed: Bool = false
 
     var body: some View {
         VStack {
@@ -24,18 +25,13 @@ struct ContentView: View {
             Text("Logging element under mouse every second...")
                 .font(.footnote)
                 .foregroundColor(.gray)
+            Toggle("Reverse Polarity", isOn: $isPolarityReversed)
+                .padding(.top)
         }
         .padding()
         .onAppear {
             scrollMonitor = ScrollWheelMonitor { deltaY, slider in
-                _ = getSliderLabel(slider) ?? "(no label)"
-                let action = deltaY > 0 ? kAXIncrementAction as String : kAXDecrementAction as String
-                let scrollMagnitude = min(abs(deltaY), 30.0)
-                let scaledActions = Int(scrollMagnitude * 0.25)
-                let numActions = max(1, scaledActions)
-                for _ in 0..<numActions {
-                    _ = AXUIElementPerformAction(slider, action as CFString)
-                }
+                handleScroll(deltaY: deltaY, slider: slider)
             }
         }
         .onDisappear {
@@ -44,6 +40,18 @@ struct ContentView: View {
         }
         .onReceive(timer) { _ in
             // logElementUnderMouse()
+        }
+    }
+
+    func handleScroll(deltaY: CGFloat, slider: AXUIElement) {
+        let effectiveDeltaY = isPolarityReversed ? -deltaY : deltaY
+        _ = getSliderLabel(slider) ?? "(no label)"
+        let action = effectiveDeltaY > 0 ? kAXIncrementAction as String : kAXDecrementAction as String
+        let scrollMagnitude = min(abs(effectiveDeltaY), 30.0)
+        let scaledActions = Int(scrollMagnitude * 0.25)
+        let numActions = max(1, scaledActions)
+        for _ in 0..<numActions {
+            _ = AXUIElementPerformAction(slider, action as CFString)
         }
     }
 }
