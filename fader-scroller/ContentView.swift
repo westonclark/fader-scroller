@@ -27,6 +27,10 @@ struct ContentView: View {
                 .foregroundColor(.gray)
             Toggle("Reverse Polarity", isOn: $isPolarityReversed)
                 .padding(.top)
+            Button("Re-sync") {
+                invalidateScrollMonitorCache()
+            }
+            .padding(.top, 8)
         }
         .padding()
         .onAppear {
@@ -53,6 +57,10 @@ struct ContentView: View {
         for _ in 0..<numActions {
             _ = AXUIElementPerformAction(slider, action as CFString)
         }
+    }
+
+    func invalidateScrollMonitorCache() {
+        scrollMonitor?.invalidateCache(full: true)
     }
 }
 
@@ -134,25 +142,49 @@ func findAllSliders(_ element: AXUIElement) -> [AXUIElement] {
     return sliders
 }
 
-func getSliderFrame(_ slider: AXUIElement) -> CGRect? {
+// Helper to get frame for any element (used for container and slider)
+func getElementFrame(_ element: AXUIElement) -> CGRect? {
     var posValue: CFTypeRef?
     var sizeValue: CFTypeRef?
-    if AXUIElementCopyAttributeValue(slider, kAXPositionAttribute as CFString, &posValue) == .success,
-       AXUIElementCopyAttributeValue(slider, kAXSizeAttribute as CFString, &sizeValue) == .success {
-        let pos = posValue as! AXValue
-        let size = sizeValue as! AXValue
-        var point = CGPoint.zero
-        var sizeStruct = CGSize.zero
-        AXValueGetValue(pos, .cgPoint, &point)
-        AXValueGetValue(size, .cgSize, &sizeStruct)
-        return CGRect(origin: point, size: sizeStruct)
+
+    guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &posValue) == .success,
+          AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success else {
+        return nil
     }
-    return nil
+
+    // Ensure the values are non-nil AND are actually AXValue types before proceeding
+    guard let pos = posValue, let size = sizeValue,
+          CFGetTypeID(pos) == AXValueGetTypeID(), // Check type ID
+          CFGetTypeID(size) == AXValueGetTypeID() else { // Check type ID
+        print("Retrieved position/size attribute is not an AXValue")
+        return nil
+    }
+
+    // Now we know they are AXValue, but still need to check the *specific* AXValue type
+    guard AXValueGetType(pos as! AXValue) == .cgPoint, // Cast is now safer
+          AXValueGetType(size as! AXValue) == .cgSize else { // Cast is now safer
+        print("AXValue is not of type CGPoint or CGSize")
+        return nil
+    }
+
+    var point = CGPoint.zero
+    var sizeStruct = CGSize.zero
+
+    // Use the unsafeBitCast pattern which is common for CF -> Swift bridging
+    // when the type is known and checked.
+    guard AXValueGetValue(pos as! AXValue, .cgPoint, &point),
+          AXValueGetValue(size as! AXValue, .cgSize, &sizeStruct) else {
+        print("Failed to convert AXValue to CGPoint/CGSize")
+        return nil
+    }
+
+    return CGRect(origin: point, size: sizeStruct)
 }
 
 func findSliderUnderMouse(_ sliders: [AXUIElement], mousePoint: CGPoint) -> AXUIElement? {
     for slider in sliders {
-        if let frame = getSliderFrame(slider), frame.contains(mousePoint) {
+        // Use the generic getElementFrame here
+        if let frame = getElementFrame(slider), frame.contains(mousePoint) {
             return slider
         }
     }
@@ -175,10 +207,14 @@ class ScrollWheelMonitor: Hashable {
     private let id = UUID()
     private let onScroll: (CGFloat, AXUIElement) -> Void
 
-    // --- Optimization: Cache the last targeted slider ---
-    private var cachedSlider: AXUIElement?
+    // --- Optimization: Enhanced Caching ---
+    private var cachedContainer: AXUIElement?        // Cache the container (e.g., window)
+    private var cachedSlidersInContainer: [AXUIElement]? // Cache sliders within the container
+    private var cachedContainerFrame: CGRect?        // Cache the container's frame for quick checks
+    private var cachedSlider: AXUIElement?           // Cache the last targeted slider
     private var cacheTimestamp: Date?
-    private let cacheTimeout: TimeInterval = 0.3 // Invalidate cache after 0.3 seconds of inactivity
+    // Increase cache timeout - adjust based on testing
+    private let cacheTimeout: TimeInterval = 0.5
 
     static func == (lhs: ScrollWheelMonitor, rhs: ScrollWheelMonitor) -> Bool {
         return lhs.id == rhs.id
@@ -194,10 +230,20 @@ class ScrollWheelMonitor: Hashable {
         ScrollWheelMonitor.activeMonitors.insert(self)
     }
 
-    private func invalidateCache() {
+    func invalidateCache(full: Bool = true) {
         // Helper to clear cache
         cachedSlider = nil
-        cacheTimestamp = nil
+        // Keep timestamp logic tied only to the specific slider cache for simplicity now
+        // cacheTimestamp = nil
+        if full {
+            cachedContainer = nil
+            cachedSlidersInContainer = nil
+            cachedContainerFrame = nil
+            print("Full cache invalidated")
+        }
+        // else {
+        //     print("Slider cache invalidated")
+        // }
     }
 
     private func setupEventTap() {
@@ -217,117 +263,177 @@ class ScrollWheelMonitor: Hashable {
                 if type == .scrollWheel {
                     let deltaY = event.getDoubleValueField(.scrollWheelEventDeltaAxis1)
                     guard deltaY != 0.0 else {
-                        print("Scroll event, but deltaY is 0")
                         return Unmanaged.passRetained(event)
                     }
 
                     let mouseLocation = NSEvent.mouseLocation
                     guard let screen = NSScreen.screens.first else {
                         print("No screen found")
-                        monitor.invalidateCache()
+                        monitor.invalidateCache(full: true) // Invalidate everything
                         return Unmanaged.passRetained(event)
                     }
                     let point = CGPoint(x: mouseLocation.x, y: screen.frame.height - mouseLocation.y)
                     let now = Date()
 
+                    // --- Cache Check Logic ---
+
+                    // 1. Check the most specific cache: the exact slider
                     if let cached = monitor.cachedSlider,
                        let lastCacheTime = monitor.cacheTimestamp,
                        now.timeIntervalSince(lastCacheTime) < monitor.cacheTimeout {
-                        if let frame = getSliderFrame(cached), frame.contains(point) {
-                            print("Using cached slider")
-                            monitor.cacheTimestamp = now
+                        // Use optional chaining for frame lookup
+                        if let frame = getElementFrame(cached), frame.contains(point) {
+                            // print("Using cached slider")
+                            monitor.cacheTimestamp = now // Refresh timestamp
                             DispatchQueue.main.async {
                                 monitor.onScroll(deltaY, cached)
                             }
-                            return nil
+                            return nil // Consume event
                         } else {
-                            print("Cached slider invalid")
-                            monitor.invalidateCache()
+                             // Mouse moved off the cached slider, clear it but keep container
+                             monitor.cachedSlider = nil
+                             // print("Mouse moved off cached slider")
                         }
                     } else if monitor.cachedSlider != nil {
-                        print("Cache expired")
-                        monitor.invalidateCache()
+                        // Slider cache expired
+                        monitor.cachedSlider = nil
+                        // print("Slider cache expired")
                     }
 
+
+                    // 2. Check the container cache if slider cache missed
+                    if let _ = monitor.cachedContainer,
+                       let sliders = monitor.cachedSlidersInContainer,
+                       let containerFrame = monitor.cachedContainerFrame,
+                       containerFrame.contains(point) {
+                        // Mouse is still within the known container, check cached sliders
+                        // print("Checking cached container sliders")
+                        if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
+                            // Found slider within cached container! Handle it.
+                            // print("Found slider within cached container")
+                            monitor.cachedSlider = slider     // Update specific slider cache
+                            monitor.cacheTimestamp = now      // Update timestamp
+                            DispatchQueue.main.async {
+                                monitor.onScroll(deltaY, slider)
+                            }
+                            return nil // Consume event
+                        } else {
+                            // Mouse is inside the container, but NOT on a cached slider.
+                            // print("No slider found at point within cached container, passing event.")
+                            // Clear the specific slider cache as we are no longer hovering over it.
+                            monitor.cachedSlider = nil
+                            // *** FIX: Do NOT perform a full lookup here. ***
+                            // The container is still valid. Let the system handle the scroll.
+                            return Unmanaged.passRetained(event) // Pass event through
+                        }
+                       // *** REMOVED FALLTHROUGH to full lookup ***
+                    } else if monitor.cachedContainer != nil {
+                         // Mouse is outside the cached container OR cache is invalid (e.g., window closed/resized?)
+                         // print("Mouse outside cached container or container invalid/expired")
+                         monitor.invalidateCache(full: true)
+                         // Now we WILL fall through to the full lookup logic below.
+                    }
+
+                    // --- Full Lookup Logic ---
+                    // This section is now only reached if:
+                    // 1. There was no valid cache initially.
+                    // 2. The mouse moved outside the previously cached container frame.
+                    // print("Performing full lookup")
                     let systemWideElement = AXUIElementCreateSystemWide()
                     var elementUnderMouse: AXUIElement?
                     let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(point.x), Float(point.y), &elementUnderMouse)
-                    print("AXUIElementCopyElementAtPosition result: \(result.rawValue), element: \(String(describing: elementUnderMouse))")
 
                     if result == .success, let element = elementUnderMouse {
-                        print("Got element under mouse")
-                        // --- Find the AXWindow under the mouse ---
-                        var windowElement: AXUIElement? = element
+                        // print("Got element under mouse")
+
+                        // --- Optimization: Check if element itself is a slider ---
                         var role: CFTypeRef?
-                        // Walk up to AXWindow if needed
-                        while AXUIElementCopyAttributeValue(windowElement!, kAXRoleAttribute as CFString, &role) == .success,
-                              let roleStr = role as? String, roleStr != kAXWindowRole as String {
-                            print("Walking up from role: \(roleStr)")
-                            if let parent = getParentElement(windowElement!) {
-                                windowElement = parent
+                        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
+                           let roleStr = role as? String, roleStr == kAXSliderRole as String {
+                            print("Element under mouse is directly a slider!")
+                            monitor.cachedSlider = element
+                            monitor.cacheTimestamp = now
+                            // Invalidate container cache as we didn't determine it here,
+                            // but this direct hit is fast anyway.
+                            monitor.invalidateCache(full: true)
+                            monitor.cachedSlider = element // Re-set slider cache after full invalidation
+                            monitor.cacheTimestamp = now
+                            DispatchQueue.main.async {
+                                monitor.onScroll(deltaY, element)
+                            }
+                            // logParentChainToSlider(from: element, mousePoint: point) // Optional: keep for debug
+                            // logSiblingsAndChildren(of: element) // Optional: keep for debug
+                            return nil // Consume event
+                        }
+
+                        // --- Find the AXWindow (or suitable container) ---
+                        var containerElement: AXUIElement? = element
+                        var containerRole: CFTypeRef?
+                        var depth = 0
+                        let maxDepth = 8 // Limit walk-up depth
+
+                        while depth < maxDepth {
+                            guard let currentElement = containerElement else { break } // Ensure not nil
+                            if AXUIElementCopyAttributeValue(currentElement, kAXRoleAttribute as CFString, &containerRole) == .success,
+                               let roleStr = containerRole as? String,
+                               roleStr == kAXWindowRole as String {
+                                // Found the window, stop walking up
+                                break
+                            }
+                            if let parent = getParentElement(currentElement) {
+                                containerElement = parent
+                                depth += 1
                             } else {
-                                print("No parent found while walking up to AXWindow")
+                                // No parent found, stop
+                                containerElement = nil
                                 break
                             }
                         }
 
-                        if let window = windowElement {
-                            print("Found AXWindow")
-                            var children: CFTypeRef?
-                            if AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &children) == .success,
-                               let childrenArray = children as? [AXUIElement] {
-                                print("AXWindow has \(childrenArray.count) children")
-                                var sliders: [AXUIElement] = []
-                                for child in childrenArray {
-                                    var childRole: CFTypeRef?
-                                    if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &childRole) == .success,
-                                       let childRoleStr = childRole as? String {
-                                        if childRoleStr == kAXSliderRole as String {
-                                            sliders.append(child)
-                                        } else if childRoleStr == kAXGroupRole as String {
-                                            // Look for sliders inside this group
-                                            var groupChildren: CFTypeRef?
-                                            if AXUIElementCopyAttributeValue(child, kAXChildrenAttribute as CFString, &groupChildren) == .success,
-                                               let groupChildrenArray = groupChildren as? [AXUIElement] {
-                                                for groupChild in groupChildrenArray {
-                                                    var groupChildRole: CFTypeRef?
-                                                    if AXUIElementCopyAttributeValue(groupChild, kAXRoleAttribute as CFString, &groupChildRole) == .success,
-                                                       let groupChildRoleStr = groupChildRole as? String,
-                                                       groupChildRoleStr == kAXSliderRole as String {
-                                                        sliders.append(groupChild)
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                        if depth >= maxDepth {
+                            print("Reached max depth (\(maxDepth)) walking up to find container")
+                            containerElement = nil // Didn't find window in reasonable depth
+                        }
+
+                        if let container = containerElement {
+                            // print("Found container")
+                            var slidersInNewContainer: [AXUIElement] = []
+                            // Search recursively within the found container, limit depth
+                            findAllSlidersRecursive(container, &slidersInNewContainer, depth: 0, maxDepth: 5) // Limit search depth
+
+                            print("Found \(slidersInNewContainer.count) sliders in new container")
+
+                            // Update container cache
+                            monitor.cachedContainer = container
+                            monitor.cachedSlidersInContainer = slidersInNewContainer
+                            monitor.cachedContainerFrame = getElementFrame(container) // Cache frame
+
+                            if let slider = findSliderUnderMouse(slidersInNewContainer, mousePoint: point) {
+                                print("Slider under mouse found in new container!")
+                                monitor.cachedSlider = slider // Cache specific slider
+                                monitor.cacheTimestamp = now
+                                DispatchQueue.main.async {
+                                    monitor.onScroll(deltaY, slider)
                                 }
-                                print("Found \(sliders.count) sliders among window's children and their children")
-                                if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
-                                    print("Slider under mouse found!")
-                                    monitor.cachedSlider = slider
-                                    monitor.cacheTimestamp = now
-                                    DispatchQueue.main.async {
-                                        monitor.onScroll(deltaY, slider)
-                                    }
-                                    logParentChainToSlider(from: element, mousePoint: point)
-                                    logSiblingsAndChildren(of: element)
-                                    return nil
-                                } else {
-                                    print("No slider under mouse found among window's children and their children")
-                                }
+                                // logParentChainToSlider(from: element, mousePoint: point) // Optional: keep for debug
+                                // logSiblingsAndChildren(of: element) // Optional: keep for debug
+                                return nil // Consume event
                             } else {
-                                print("AXWindow has no children or failed to get children")
+                                print("No slider under mouse found in new container")
+                                // Keep container cache, but clear specific slider cache
+                                monitor.cachedSlider = nil
                             }
                         } else {
-                            print("No AXWindow found")
+                            print("No suitable container (Window) found walking up")
+                            monitor.invalidateCache(full: true) // Full invalidate if lookup failed
                         }
-                        monitor.invalidateCache()
                     } else {
-                        print("Failed to get element under mouse")
-                        monitor.invalidateCache()
+                        print("Failed to get element under mouse (Error: \(result.rawValue))")
+                        monitor.invalidateCache(full: true) // Full invalidate if lookup failed
                     }
                 }
-                return Unmanaged.passRetained(event)
+                // print("Event passed through")
+                return Unmanaged.passRetained(event) // Pass event if no slider handled it
             },
             userInfo: selfPtr)
 
@@ -341,7 +447,7 @@ class ScrollWheelMonitor: Hashable {
     }
 
     func cleanup() {
-        invalidateCache()
+        invalidateCache(full: true) // Clear all cache on cleanup
         if let runLoopSource = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         }
@@ -420,6 +526,36 @@ func logSiblingsAndChildren(of element: AXUIElement) {
     } else {
         print("No parent, so no siblings.")
     }
+}
+
+// Recursive slider search with depth limit
+func findAllSlidersRecursive(_ element: AXUIElement, _ sliders: inout [AXUIElement], depth: Int, maxDepth: Int) {
+    if depth > maxDepth { return } // Stop recursion if too deep
+
+    var role: CFTypeRef?
+    if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
+       let roleStr = role as? String {
+
+        if roleStr == kAXSliderRole as String {
+            sliders.append(element)
+            // Don't search children of sliders themselves typically
+            return
+        }
+
+        // Recurse into children regardless of parent type, but respect maxDepth
+        var children: CFTypeRef?
+        // Check if children attribute exists before trying to copy it
+        var _: DarwinBoolean = false
+        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
+           let childrenArray = children as? [AXUIElement] {
+             // print("Depth \(depth): Element \(roleStr) has \(childrenArray.count) children. MaxDepth: \(maxDepth)") // Debug
+            for child in childrenArray {
+                findAllSlidersRecursive(child, &sliders, depth: depth + 1, maxDepth: maxDepth)
+            }
+        }
+         // else { print("Depth \(depth): Element \(roleStr) has no children or failed to get.")} // Debug
+    }
+    // else { print("Depth \(depth): Failed to get role for element.") } // Debug
 }
 
 #Preview {
