@@ -209,11 +209,13 @@ class ScrollWheelMonitor: Hashable {
                 if type == .scrollWheel {
                     let deltaY = event.getDoubleValueField(.scrollWheelEventDeltaAxis1)
                     guard deltaY != 0.0 else {
+                        print("Scroll event, but deltaY is 0")
                         return Unmanaged.passRetained(event)
                     }
 
                     let mouseLocation = NSEvent.mouseLocation
                     guard let screen = NSScreen.screens.first else {
+                        print("No screen found")
                         monitor.invalidateCache()
                         return Unmanaged.passRetained(event)
                     }
@@ -224,47 +226,96 @@ class ScrollWheelMonitor: Hashable {
                        let lastCacheTime = monitor.cacheTimestamp,
                        now.timeIntervalSince(lastCacheTime) < monitor.cacheTimeout {
                         if let frame = getSliderFrame(cached), frame.contains(point) {
+                            print("Using cached slider")
                             monitor.cacheTimestamp = now
                             DispatchQueue.main.async {
                                 monitor.onScroll(deltaY, cached)
                             }
                             return nil
                         } else {
+                            print("Cached slider invalid")
                             monitor.invalidateCache()
                         }
                     } else if monitor.cachedSlider != nil {
+                        print("Cache expired")
                         monitor.invalidateCache()
                     }
 
                     let systemWideElement = AXUIElementCreateSystemWide()
                     var elementUnderMouse: AXUIElement?
                     let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(point.x), Float(point.y), &elementUnderMouse)
+                    print("AXUIElementCopyElementAtPosition result: \(result.rawValue), element: \(String(describing: elementUnderMouse))")
 
                     if result == .success, let element = elementUnderMouse {
-                        var targetSlider: AXUIElement? = nil
-                        var searchElement: AXUIElement? = element
-
-                        for _ in 0..<3 {
-                            guard let currentSearchElement = searchElement else { break }
-                            let sliders = findAllSliders(currentSearchElement)
-                            if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
-                                targetSlider = slider
+                        print("Got element under mouse")
+                        // --- Find the AXWindow under the mouse ---
+                        var windowElement: AXUIElement? = element
+                        var role: CFTypeRef?
+                        // Walk up to AXWindow if needed
+                        while AXUIElementCopyAttributeValue(windowElement!, kAXRoleAttribute as CFString, &role) == .success,
+                              let roleStr = role as? String, roleStr != kAXWindowRole as String {
+                            print("Walking up from role: \(roleStr)")
+                            if let parent = getParentElement(windowElement!) {
+                                windowElement = parent
+                            } else {
+                                print("No parent found while walking up to AXWindow")
                                 break
                             }
-                            searchElement = getParentElement(currentSearchElement)
                         }
 
-                        if let slider = targetSlider {
-                            monitor.cachedSlider = slider
-                            monitor.cacheTimestamp = now
-                            DispatchQueue.main.async {
-                                monitor.onScroll(deltaY, slider)
+                        if let window = windowElement {
+                            print("Found AXWindow")
+                            var children: CFTypeRef?
+                            if AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &children) == .success,
+                               let childrenArray = children as? [AXUIElement] {
+                                print("AXWindow has \(childrenArray.count) children")
+                                var sliders: [AXUIElement] = []
+                                for child in childrenArray {
+                                    var childRole: CFTypeRef?
+                                    if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &childRole) == .success,
+                                       let childRoleStr = childRole as? String {
+                                        if childRoleStr == kAXSliderRole as String {
+                                            sliders.append(child)
+                                        } else if childRoleStr == kAXGroupRole as String {
+                                            // Look for sliders inside this group
+                                            var groupChildren: CFTypeRef?
+                                            if AXUIElementCopyAttributeValue(child, kAXChildrenAttribute as CFString, &groupChildren) == .success,
+                                               let groupChildrenArray = groupChildren as? [AXUIElement] {
+                                                for groupChild in groupChildrenArray {
+                                                    var groupChildRole: CFTypeRef?
+                                                    if AXUIElementCopyAttributeValue(groupChild, kAXRoleAttribute as CFString, &groupChildRole) == .success,
+                                                       let groupChildRoleStr = groupChildRole as? String,
+                                                       groupChildRoleStr == kAXSliderRole as String {
+                                                        sliders.append(groupChild)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                print("Found \(sliders.count) sliders among window's children and their children")
+                                if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
+                                    print("Slider under mouse found!")
+                                    monitor.cachedSlider = slider
+                                    monitor.cacheTimestamp = now
+                                    DispatchQueue.main.async {
+                                        monitor.onScroll(deltaY, slider)
+                                    }
+                                    logParentChainToSlider(from: element, mousePoint: point)
+                                    logSiblingsAndChildren(of: element)
+                                    return nil
+                                } else {
+                                    print("No slider under mouse found among window's children and their children")
+                                }
+                            } else {
+                                print("AXWindow has no children or failed to get children")
                             }
-                            return nil
                         } else {
-                            monitor.invalidateCache()
+                            print("No AXWindow found")
                         }
+                        monitor.invalidateCache()
                     } else {
+                        print("Failed to get element under mouse")
                         monitor.invalidateCache()
                     }
                 }
@@ -303,6 +354,63 @@ class ScrollWheelMonitor: Hashable {
             monitor.cleanup()
         }
         activeMonitors.removeAll()
+    }
+}
+
+func logParentChainToSlider(from element: AXUIElement, mousePoint: CGPoint) {
+    var current: AXUIElement? = element
+    var depth = 0
+    var foundSlider = false
+
+    while let el = current, depth < 10 { // Limit to 10 to avoid infinite loops
+        var role: CFTypeRef?
+        var desc: CFTypeRef?
+        let roleStr = (AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &role) == .success) ? (role as? String ?? "nil") : "error"
+        let descStr = (AXUIElementCopyAttributeValue(el, kAXDescriptionAttribute as CFString, &desc) == .success) ? (desc as? String ?? "nil") : "error"
+        print("Depth \(depth): Role = \(roleStr), Description = \(descStr)")
+
+        if roleStr == kAXSliderRole as String {
+            print("Found slider at depth \(depth)!")
+            foundSlider = true
+            break
+        }
+        current = getParentElement(el)
+        depth += 1
+    }
+    if !foundSlider {
+        print("No slider found in parent chain up to depth \(depth)")
+    }
+}
+
+func logSiblingsAndChildren(of element: AXUIElement) {
+    // Log children
+    var children: CFTypeRef?
+    if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
+       let childrenArray = children as? [AXUIElement] {
+        print("Children of current element:")
+        for (i, child) in childrenArray.enumerated() {
+            var role: CFTypeRef?
+            let roleStr = (AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role) == .success) ? (role as? String ?? "nil") : "error"
+            print("  Child \(i): Role = \(roleStr)")
+        }
+    } else {
+        print("No children for current element.")
+    }
+
+    // Log siblings
+    if let parent = getParentElement(element) {
+        var siblings: CFTypeRef?
+        if AXUIElementCopyAttributeValue(parent, kAXChildrenAttribute as CFString, &siblings) == .success,
+           let siblingsArray = siblings as? [AXUIElement] {
+            print("Siblings of current element:")
+            for (i, sibling) in siblingsArray.enumerated() {
+                var role: CFTypeRef?
+                let roleStr = (AXUIElementCopyAttributeValue(sibling, kAXRoleAttribute as CFString, &role) == .success) ? (role as? String ?? "nil") : "error"
+                print("  Sibling \(i): Role = \(roleStr)")
+            }
+        }
+    } else {
+        print("No parent, so no siblings.")
     }
 }
 
