@@ -60,7 +60,7 @@ struct ContentView: View {
     }
 
     func invalidateScrollMonitorCache() {
-        scrollMonitor?.invalidateCache(full: true)
+        scrollMonitor?.invalidateCache()
     }
 }
 
@@ -207,14 +207,14 @@ class ScrollWheelMonitor: Hashable {
     private let id = UUID()
     private let onScroll: (CGFloat, AXUIElement) -> Void
 
-    // --- Optimization: Enhanced Caching ---
-    private var cachedContainer: AXUIElement?        // Cache the container (e.g., window)
-    private var cachedSlidersInContainer: [AXUIElement]? // Cache sliders within the container
-    private var cachedContainerFrame: CGRect?        // Cache the container's frame for quick checks
-    private var cachedSlider: AXUIElement?           // Cache the last targeted slider
-    private var cacheTimestamp: Date?
-    // Increase cache timeout - adjust based on testing
-    private let cacheTimeout: TimeInterval = 0.5
+    // Simplified cache structure
+    private struct CachedFader {
+        let element: AXUIElement
+        let frame: CGRect
+        let timestamp: Date
+    }
+    private var cachedFaders: [CachedFader] = []
+    private let cacheTimeout: TimeInterval = 2.0  // Increased timeout since we're caching more faders
 
     static func == (lhs: ScrollWheelMonitor, rhs: ScrollWheelMonitor) -> Bool {
         return lhs.id == rhs.id
@@ -230,20 +230,9 @@ class ScrollWheelMonitor: Hashable {
         ScrollWheelMonitor.activeMonitors.insert(self)
     }
 
-    func invalidateCache(full: Bool = true) {
-        // Helper to clear cache
-        cachedSlider = nil
-        // Keep timestamp logic tied only to the specific slider cache for simplicity now
-        // cacheTimestamp = nil
-        if full {
-            cachedContainer = nil
-            cachedSlidersInContainer = nil
-            cachedContainerFrame = nil
-            print("Full cache invalidated")
-        }
-        // else {
-        //     print("Slider cache invalidated")
-        // }
+    func invalidateCache() {
+        cachedFaders.removeAll()
+        print("Fader cache invalidated")
     }
 
     private func setupEventTap() {
@@ -255,185 +244,90 @@ class ScrollWheelMonitor: Hashable {
             options: .defaultTap,
             eventsOfInterest: CGEventMask(1 << CGEventType.scrollWheel.rawValue),
             callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
-                guard let refcon = refcon else {
-                    return Unmanaged.passRetained(event)
-                }
+                guard let refcon = refcon else { return Unmanaged.passRetained(event) }
                 let monitor = Unmanaged<ScrollWheelMonitor>.fromOpaque(refcon).takeUnretainedValue()
 
                 if type == .scrollWheel {
                     let deltaY = event.getDoubleValueField(.scrollWheelEventDeltaAxis1)
-                    guard deltaY != 0.0 else {
-                        return Unmanaged.passRetained(event)
-                    }
+                    guard deltaY != 0.0 else { return Unmanaged.passRetained(event) }
 
                     let mouseLocation = NSEvent.mouseLocation
                     guard let screen = NSScreen.screens.first else {
-                        print("No screen found")
-                        monitor.invalidateCache(full: true) // Invalidate everything
+                        monitor.invalidateCache()
                         return Unmanaged.passRetained(event)
                     }
                     let point = CGPoint(x: mouseLocation.x, y: screen.frame.height - mouseLocation.y)
                     let now = Date()
 
-                    // --- Cache Check Logic ---
-
-                    // 1. Check the most specific cache: the exact slider
-                    if let cached = monitor.cachedSlider,
-                       let lastCacheTime = monitor.cacheTimestamp,
-                       now.timeIntervalSince(lastCacheTime) < monitor.cacheTimeout {
-                        // Use optional chaining for frame lookup
-                        if let frame = getElementFrame(cached), frame.contains(point) {
-                            // print("Using cached slider")
-                            monitor.cacheTimestamp = now // Refresh timestamp
-                            DispatchQueue.main.async {
-                                monitor.onScroll(deltaY, cached)
-                            }
-                            return nil // Consume event
-                        } else {
-                             // Mouse moved off the cached slider, clear it but keep container
-                             monitor.cachedSlider = nil
-                             // print("Mouse moved off cached slider")
+                    // First check the cache
+                    if !monitor.cachedFaders.isEmpty {
+                        // Remove expired cache entries
+                        monitor.cachedFaders.removeAll {
+                            now.timeIntervalSince($0.timestamp) > monitor.cacheTimeout
                         }
-                    } else if monitor.cachedSlider != nil {
-                        // Slider cache expired
-                        monitor.cachedSlider = nil
-                        // print("Slider cache expired")
+
+                        // Check if mouse is over any cached fader
+                        if let cachedFader = monitor.cachedFaders.first(where: { $0.frame.contains(point) }) {
+                            // Verify the fader is still valid by checking its frame
+                            if let currentFrame = getElementFrame(cachedFader.element),
+                               currentFrame == cachedFader.frame {
+                                DispatchQueue.main.async {
+                                    monitor.onScroll(deltaY, cachedFader.element)
+                                }
+                                return nil // Consume event
+                            }
+                        }
                     }
 
-
-                    // 2. Check the container cache if slider cache missed
-                    if let _ = monitor.cachedContainer,
-                       let sliders = monitor.cachedSlidersInContainer,
-                       let containerFrame = monitor.cachedContainerFrame,
-                       containerFrame.contains(point) {
-                        // Mouse is still within the known container, check cached sliders
-                        // print("Checking cached container sliders")
-                        if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
-                            // Found slider within cached container! Handle it.
-                            // print("Found slider within cached container")
-                            monitor.cachedSlider = slider     // Update specific slider cache
-                            monitor.cacheTimestamp = now      // Update timestamp
-                            DispatchQueue.main.async {
-                                monitor.onScroll(deltaY, slider)
-                            }
-                            return nil // Consume event
-                        } else {
-                            // Mouse is inside the container, but NOT on a cached slider.
-                            // print("No slider found at point within cached container, passing event.")
-                            // Clear the specific slider cache as we are no longer hovering over it.
-                            monitor.cachedSlider = nil
-                            // *** FIX: Do NOT perform a full lookup here. ***
-                            // The container is still valid. Let the system handle the scroll.
-                            return Unmanaged.passRetained(event) // Pass event through
-                        }
-                       // *** REMOVED FALLTHROUGH to full lookup ***
-                    } else if monitor.cachedContainer != nil {
-                         // Mouse is outside the cached container OR cache is invalid (e.g., window closed/resized?)
-                         // print("Mouse outside cached container or container invalid/expired")
-                         monitor.invalidateCache(full: true)
-                         // Now we WILL fall through to the full lookup logic below.
-                    }
-
-                    // --- Full Lookup Logic ---
-                    // This section is now only reached if:
-                    // 1. There was no valid cache initially.
-                    // 2. The mouse moved outside the previously cached container frame.
-                    // print("Performing full lookup")
+                    // Direct lookup for element under mouse
                     let systemWideElement = AXUIElementCreateSystemWide()
                     var elementUnderMouse: AXUIElement?
                     let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(point.x), Float(point.y), &elementUnderMouse)
 
                     if result == .success, let element = elementUnderMouse {
-                        // print("Got element under mouse")
-
-                        // --- Optimization: Check if element itself is a slider ---
+                        // Check if element is a slider
                         var role: CFTypeRef?
                         if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
-                           let roleStr = role as? String, roleStr == kAXSliderRole as String {
-                            print("Element under mouse is directly a slider!")
-                            monitor.cachedSlider = element
-                            monitor.cacheTimestamp = now
-                            // Invalidate container cache as we didn't determine it here,
-                            // but this direct hit is fast anyway.
-                            monitor.invalidateCache(full: true)
-                            monitor.cachedSlider = element // Re-set slider cache after full invalidation
-                            monitor.cacheTimestamp = now
-                            DispatchQueue.main.async {
-                                monitor.onScroll(deltaY, element)
-                            }
-                            // logParentChainToSlider(from: element, mousePoint: point) // Optional: keep for debug
-                            // logSiblingsAndChildren(of: element) // Optional: keep for debug
-                            return nil // Consume event
-                        }
-
-                        // --- Find the AXWindow (or suitable container) ---
-                        var containerElement: AXUIElement? = element
-                        var containerRole: CFTypeRef?
-                        var depth = 0
-                        let maxDepth = 8 // Limit walk-up depth
-
-                        while depth < maxDepth {
-                            guard let currentElement = containerElement else { break } // Ensure not nil
-                            if AXUIElementCopyAttributeValue(currentElement, kAXRoleAttribute as CFString, &containerRole) == .success,
-                               let roleStr = containerRole as? String,
-                               roleStr == kAXWindowRole as String {
-                                // Found the window, stop walking up
-                                break
-                            }
-                            if let parent = getParentElement(currentElement) {
-                                containerElement = parent
-                                depth += 1
-                            } else {
-                                // No parent found, stop
-                                containerElement = nil
-                                break
-                            }
-                        }
-
-                        if depth >= maxDepth {
-                            print("Reached max depth (\(maxDepth)) walking up to find container")
-                            containerElement = nil // Didn't find window in reasonable depth
-                        }
-
-                        if let container = containerElement {
-                            // print("Found container")
-                            var slidersInNewContainer: [AXUIElement] = []
-                            // Search recursively within the found container, limit depth
-                            findAllSlidersRecursive(container, &slidersInNewContainer, depth: 0, maxDepth: 5) // Limit search depth
-
-                            print("Found \(slidersInNewContainer.count) sliders in new container")
-
-                            // Update container cache
-                            monitor.cachedContainer = container
-                            monitor.cachedSlidersInContainer = slidersInNewContainer
-                            monitor.cachedContainerFrame = getElementFrame(container) // Cache frame
-
-                            if let slider = findSliderUnderMouse(slidersInNewContainer, mousePoint: point) {
-                                print("Slider under mouse found in new container!")
-                                monitor.cachedSlider = slider // Cache specific slider
-                                monitor.cacheTimestamp = now
+                           let roleStr = role as? String,
+                           roleStr == kAXSliderRole as String {
+                            // Found a slider directly!
+                            if let frame = getElementFrame(element) {
+                                // Add to cache
+                                monitor.cachedFaders.append(CachedFader(
+                                    element: element,
+                                    frame: frame,
+                                    timestamp: now
+                                ))
                                 DispatchQueue.main.async {
-                                    monitor.onScroll(deltaY, slider)
+                                    monitor.onScroll(deltaY, element)
                                 }
-                                // logParentChainToSlider(from: element, mousePoint: point) // Optional: keep for debug
-                                // logSiblingsAndChildren(of: element) // Optional: keep for debug
                                 return nil // Consume event
-                            } else {
-                                print("No slider under mouse found in new container")
-                                // Keep container cache, but clear specific slider cache
-                                monitor.cachedSlider = nil
                             }
-                        } else {
-                            print("No suitable container (Window) found walking up")
-                            monitor.invalidateCache(full: true) // Full invalidate if lookup failed
                         }
-                    } else {
-                        print("Failed to get element under mouse (Error: \(result.rawValue))")
-                        monitor.invalidateCache(full: true) // Full invalidate if lookup failed
+
+                        // If not a slider directly, do a quick search in nearby elements
+                        var nearbySliders: [AXUIElement] = []
+                        findAllSlidersRecursive(element, &nearbySliders, depth: 0, maxDepth: 3)
+
+                        for slider in nearbySliders {
+                            if let frame = getElementFrame(slider) {
+                                monitor.cachedFaders.append(CachedFader(
+                                    element: slider,
+                                    frame: frame,
+                                    timestamp: now
+                                ))
+
+                                if frame.contains(point) {
+                                    DispatchQueue.main.async {
+                                        monitor.onScroll(deltaY, slider)
+                                    }
+                                    return nil // Consume event
+                                }
+                            }
+                        }
                     }
                 }
-                // print("Event passed through")
-                return Unmanaged.passRetained(event) // Pass event if no slider handled it
+                return Unmanaged.passRetained(event)
             },
             userInfo: selfPtr)
 
@@ -447,7 +341,7 @@ class ScrollWheelMonitor: Hashable {
     }
 
     func cleanup() {
-        invalidateCache(full: true) // Clear all cache on cleanup
+        invalidateCache()
         if let runLoopSource = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         }
