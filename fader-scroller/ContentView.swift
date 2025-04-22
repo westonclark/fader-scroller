@@ -327,6 +327,9 @@ func findFaderAtPosition(_ x: CGFloat, _ y: CGFloat, in faders: [FaderInfo]) -> 
 }
 
 class ScrollWheelMonitor: Hashable {
+    private let cacheUpdateQueue = DispatchQueue(label: "com.faderscroller.cacheupdates")
+    private var isUpdatingCache = false
+
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private static var activeMonitors: Set<ScrollWheelMonitor> = []
@@ -355,6 +358,8 @@ class ScrollWheelMonitor: Hashable {
     }
 
     private func checkReferencePositionAndUpdateCache() {
+        guard !isUpdatingCache else { return }
+
         guard let cache = cache,
               !cache.visibleFaders.isEmpty else {
             updateCacheIfNeeded()
@@ -366,27 +371,32 @@ class ScrollWheelMonitor: Hashable {
         if let frame = getElementFrame(referenceFader) {
             let currentPosition = CGPoint(x: frame.minX, y: frame.minY)
 
-            // If reference fader has moved significantly (e.g., more than 1 pixel)
+            // If reference fader has moved significantly
             if abs(currentPosition.x - cache.referenceFaderPosition.x) > 1.0 ||
                abs(currentPosition.y - cache.referenceFaderPosition.y) > 1.0 {
                 print("Reference fader position changed - updating cache with new positions")
 
-                // Instead of just invalidating, immediately get new fader positions
-                let allFaders = getAllSortedFaders()
-                if !allFaders.isEmpty {
-                    // Create new cache with updated positions
-                    self.cache = WindowedCache(
-                        visibleFaders: allFaders,
-                        timestamp: Date(),
-                        referenceFaderPosition: CGPoint(x: allFaders[0].frame.minX, y: allFaders[0].frame.minY)
-                    )
-                } else {
-                    // If we couldn't get new faders, invalidate cache
-                    invalidateCache()
+                isUpdatingCache = true
+                cacheUpdateQueue.async { [weak self] in
+                    guard let self = self else { return }
+
+                    let allFaders = getAllSortedFaders()
+
+                    DispatchQueue.main.async {
+                        if !allFaders.isEmpty {
+                            self.cache = WindowedCache(
+                                visibleFaders: allFaders,
+                                timestamp: Date(),
+                                referenceFaderPosition: CGPoint(x: allFaders[0].frame.minX, y: allFaders[0].frame.minY)
+                            )
+                        } else {
+                            self.invalidateCache()
+                        }
+                        self.isUpdatingCache = false
+                    }
                 }
             }
         } else {
-            // If we can't get the frame of our reference fader, something's wrong
             print("Could not get reference fader frame - invalidating cache")
             invalidateCache()
         }
@@ -398,22 +408,31 @@ class ScrollWheelMonitor: Hashable {
             return
         }
 
-        let now = Date()
+        // Skip if we're already updating
+        guard !isUpdatingCache else { return }
 
-        // Get all faders
-        let allFaders = getAllSortedFaders()
+        // Set updating flag
+        isUpdatingCache = true
 
-        // If we have no faders, nothing to cache
-        guard !allFaders.isEmpty else { return }
+        // Do the heavy lifting in background
+        cacheUpdateQueue.async { [weak self] in
+            guard let self = self else { return }
 
-        // Store the position of our reference fader (first fader)
-        let referencePosition = CGPoint(x: allFaders[0].frame.minX, y: allFaders[0].frame.minY)
+            let now = Date()
+            let allFaders = getAllSortedFaders()
 
-        cache = WindowedCache(
-            visibleFaders: allFaders,
-            timestamp: now,
-            referenceFaderPosition: referencePosition
-        )
+            // Update cache on main thread
+            DispatchQueue.main.async {
+                if !allFaders.isEmpty {
+                    self.cache = WindowedCache(
+                        visibleFaders: allFaders,
+                        timestamp: now,
+                        referenceFaderPosition: CGPoint(x: allFaders[0].frame.minX, y: allFaders[0].frame.minY)
+                    )
+                }
+                self.isUpdatingCache = false
+            }
+        }
     }
 
     private func setupEventTap() {
@@ -516,7 +535,12 @@ class ScrollWheelMonitor: Hashable {
     }
 
     func cleanup() {
+        // Since we're using a serial queue, this will wait for any ongoing work
+        cacheUpdateQueue.sync { }
+
         invalidateCache()
+        isUpdatingCache = false
+
         if let runLoopSource = runLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         }
