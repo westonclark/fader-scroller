@@ -10,6 +10,10 @@ import Cocoa
 import ApplicationServices
 import CoreGraphics
 
+// Accessibility role constants
+let kAXScrollArea = "AXScrollArea" as CFString
+let kAXGroup = "AXGroup" as CFString
+
 struct ContentView: View {
     // Add a timer that fires every second
     let timer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
@@ -38,18 +42,18 @@ struct ContentView: View {
                 handleScroll(deltaY: deltaY, slider: slider)
             }
         }
+        .onReceive(timer) { _ in
+            // Check and update cache every second
+            scrollMonitor?.checkAndUpdateCache()
+        }
         .onDisappear {
             scrollMonitor?.cleanup()
             scrollMonitor = nil
-        }
-        .onReceive(timer) { _ in
-            // logElementUnderMouse()
         }
     }
 
     func handleScroll(deltaY: CGFloat, slider: AXUIElement) {
         let effectiveDeltaY = isPolarityReversed ? -deltaY : deltaY
-        _ = getSliderLabel(slider) ?? "(no label)"
         let action = effectiveDeltaY > 0 ? kAXIncrementAction as String : kAXDecrementAction as String
         let scrollMagnitude = min(abs(effectiveDeltaY), 30.0)
         let scaledActions = Int(scrollMagnitude * 0.25)
@@ -67,28 +71,6 @@ struct ContentView: View {
 func checkAccessibilityPermission() -> Bool {
     return AXIsProcessTrusted()
 }
-
-// func logElementUnderMouse() {
-//     let mouseLocation = NSEvent.mouseLocation
-//     guard let screen = NSScreen.screens.first else { return }
-//     let point = CGPoint(x: mouseLocation.x, y: screen.frame.height - mouseLocation.y)
-
-//     let systemWideElement = AXUIElementCreateSystemWide()
-//     var element: AXUIElement?
-//     let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(point.x), Float(point.y), &element)
-//     if result == .success, let element = element {
-//         let sliders = findAllSliders(element)
-//         if sliders.isEmpty {
-//             // No sliders under mouse.
-//         } else if let slider = findSliderUnderMouse(sliders, mousePoint: point) {
-//             // Slider under mouse found.
-//         } else {
-//             // No slider directly under mouse (but found some in subtree).
-//         }
-//     } else {
-//         // Could not get accessibility element under mouse.
-//     }
-// }
 
 func findSliderElement(_ element: AXUIElement, depth: Int = 0) -> AXUIElement? {
     var role: CFTypeRef?
@@ -109,38 +91,23 @@ func findSliderElement(_ element: AXUIElement, depth: Int = 0) -> AXUIElement? {
     return nil
 }
 
-func getSliderLabel(_ slider: AXUIElement) -> String? {
-    var title: CFTypeRef?
-    if AXUIElementCopyAttributeValue(slider, kAXTitleAttribute as CFString, &title) == .success,
-       let titleStr = title as? String {
-        return titleStr
-    }
-    // Try description if title is not available
-    var desc: CFTypeRef?
-    if AXUIElementCopyAttributeValue(slider, kAXDescriptionAttribute as CFString, &desc) == .success,
-       let descStr = desc as? String {
-        return descStr
-    }
-    return nil
-}
-
-func findAllSliders(_ element: AXUIElement) -> [AXUIElement] {
-    var sliders: [AXUIElement] = []
-    var role: CFTypeRef?
-    if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
-       let roleStr = role as? String, roleStr == kAXSliderRole as String {
-        sliders.append(element)
-    }
-    // Recursively check children
-    var children: CFTypeRef?
-    if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
-       let childrenArray = children as? [AXUIElement] {
-        for child in childrenArray {
-            sliders.append(contentsOf: findAllSliders(child))
-        }
-    }
-    return sliders
-}
+// func findAllSliders(_ element: AXUIElement) -> [AXUIElement] {
+//     var sliders: [AXUIElement] = []
+//     var role: CFTypeRef?
+//     if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
+//        let roleStr = role as? String, roleStr == kAXSliderRole as String {
+//         sliders.append(element)
+//     }
+//     // Recursively check children
+//     var children: CFTypeRef?
+//     if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
+//        let childrenArray = children as? [AXUIElement] {
+//         for child in childrenArray {
+//             sliders.append(contentsOf: findAllSliders(child))
+//         }
+//     }
+//     return sliders
+// }
 
 // Helper to get frame for any element (used for container and slider)
 func getElementFrame(_ element: AXUIElement) -> CGRect? {
@@ -155,7 +122,7 @@ func getElementFrame(_ element: AXUIElement) -> CGRect? {
     // Ensure the values are non-nil AND are actually AXValue types before proceeding
     guard let pos = posValue, let size = sizeValue,
           CFGetTypeID(pos) == AXValueGetTypeID(), // Check type ID
-          CFGetTypeID(size) == AXValueGetTypeID() else { // Check type ID
+          CFGetTypeID(size) == AXValueGetTypeID() else {
         print("Retrieved position/size attribute is not an AXValue")
         return nil
     }
@@ -181,15 +148,15 @@ func getElementFrame(_ element: AXUIElement) -> CGRect? {
     return CGRect(origin: point, size: sizeStruct)
 }
 
-func findSliderUnderMouse(_ sliders: [AXUIElement], mousePoint: CGPoint) -> AXUIElement? {
-    for slider in sliders {
-        // Use the generic getElementFrame here
-        if let frame = getElementFrame(slider), frame.contains(mousePoint) {
-            return slider
-        }
-    }
-    return nil
-}
+// func findSliderUnderMouse(_ sliders: [AXUIElement], mousePoint: CGPoint) -> AXUIElement? {
+//     for slider in sliders {
+//         // Use the generic getElementFrame here
+//         if let frame = getElementFrame(slider), frame.contains(mousePoint) {
+//             return slider
+//         }
+//     }
+//     return nil
+// }
 
 // Helper function to get the parent of an element
 func getParentElement(_ element: AXUIElement) -> AXUIElement? {
@@ -200,21 +167,173 @@ func getParentElement(_ element: AXUIElement) -> AXUIElement? {
     return nil
 }
 
+// New structure to hold fader info
+struct FaderInfo {
+    let element: AXUIElement
+    let frame: CGRect
+    let xPosition: CGFloat
+}
+
+// Function to get application element from any element
+func getApplicationElement(_ element: AXUIElement) -> AXUIElement? {
+    var current: AXUIElement? = element
+    while let el = current {
+        var role: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &role) == .success,
+           let roleStr = role as? String,
+           roleStr == kAXApplicationRole as String {
+            return el
+        }
+        current = getParentElement(el)
+    }
+    return nil
+}
+
+// Function to get all faders in sorted order
+func getAllSortedFaders() -> [FaderInfo] {
+    let systemWideElement = AXUIElementCreateSystemWide()
+    var element: AXUIElement?
+    let mouseLocation = NSEvent.mouseLocation
+
+    // Get element under mouse first to find the application
+    let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(mouseLocation.x), Float(mouseLocation.y), &element)
+    guard result == .success,
+          let element = element,
+          let appElement = getApplicationElement(element) else {
+        return []
+    }
+
+    // Get all windows
+    var children: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(appElement, kAXChildrenAttribute as CFString, &children) == .success,
+          let childrenArray = children as? [AXUIElement] else {
+        return []
+    }
+
+    // Find the Mix window
+    var mixWindow: AXUIElement?
+    for child in childrenArray {
+        var role: CFTypeRef?
+        var title: CFTypeRef?
+        if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role) == .success,
+           AXUIElementCopyAttributeValue(child, kAXTitleAttribute as CFString, &title) == .success,
+           let roleStr = role as? String,
+           let titleStr = title as? String,
+           roleStr == kAXWindowRole as String,
+           titleStr.hasPrefix("Mix:") {
+            mixWindow = child
+            break
+        }
+    }
+
+    guard let mixWindow = mixWindow else {
+        return []
+    }
+
+    // Get the channels container from the Mix window
+    var mixChildren: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(mixWindow, kAXChildrenAttribute as CFString, &mixChildren) == .success,
+          let mixChildrenArray = mixChildren as? [AXUIElement] else {
+        return []
+    }
+
+    // Find all track groups (they have role AXGroup and title containing "Audio")
+    var trackGroups: [AXUIElement] = []
+    for child in mixChildrenArray {
+        var role: CFTypeRef?
+        var title: CFTypeRef?
+        if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role) == .success,
+           AXUIElementCopyAttributeValue(child, kAXTitleAttribute as CFString, &title) == .success,
+           let roleStr = role as? String,
+           let titleStr = title as? String,
+           roleStr == kAXGroup as String,
+           titleStr.contains("Audio") {
+            trackGroups.append(child)
+        }
+    }
+
+    // Get all faders from each track group
+    var allFaders: [AXUIElement] = []
+    for group in trackGroups {
+        var groupChildren: CFTypeRef?
+        if AXUIElementCopyAttributeValue(group, kAXChildrenAttribute as CFString, &groupChildren) == .success,
+           let children = groupChildren as? [AXUIElement] {
+            // Look for sliders in this group
+            for child in children {
+                var role: CFTypeRef?
+                if AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role) == .success,
+                   let roleStr = role as? String,
+                   roleStr == kAXSliderRole as String {
+                    allFaders.append(child)
+                }
+            }
+        }
+    }
+
+    // Convert to FaderInfo, only including volume faders
+    let allFaderInfos = allFaders.compactMap { fader -> FaderInfo? in
+        var title: CFTypeRef?
+        var type: AnyObject?
+        var orientation: CFTypeRef?
+
+        // Get all relevant attributes
+        AXUIElementCopyAttributeValue(fader, kAXTitleAttribute as CFString, &title)
+        AXUIElementCopyAttributeValue(fader, kAXRoleDescriptionAttribute as CFString, &type)
+        AXUIElementCopyAttributeValue(fader, kAXOrientationAttribute as CFString, &orientation)
+
+        let titleStr = title as? String ?? "nil"
+        let typeStr = type as? String ?? "nil"
+        let orientationStr = orientation as? String ?? "nil"
+
+        // Check if this is a volume fader
+        if titleStr == "Volume" && typeStr == "Fader" && orientationStr == "AXVerticalOrientation" {
+            guard let frame = getElementFrame(fader) else { return nil }
+            return FaderInfo(element: fader, frame: frame, xPosition: frame.minX)
+        }
+        return nil
+    }
+
+    // Only keep the first fader of each pair (the actual fader control)
+    return stride(from: 0, to: allFaderInfos.count, by: 2).map { allFaderInfos[$0] }
+}
+
+// Find the correct fader based on X position and verify Y position is within bounds
+func findFaderAtPosition(_ x: CGFloat, _ y: CGFloat, in faders: [FaderInfo]) -> AXUIElement? {
+    guard !faders.isEmpty else { return nil }
+
+    // If we only have one fader, verify Y position
+    if faders.count == 1 {
+        return faders[0].frame.minY <= y && y <= faders[0].frame.maxY ? faders[0].element : nil
+    }
+
+    // Calculate the width of each fader section
+    let firstX = faders[0].xPosition
+    let lastX = faders[faders.count - 1].xPosition
+    let sectionWidth = (lastX - firstX) / CGFloat(faders.count - 1)
+
+    // Calculate the index based on X position
+    var index = Int(round((x - firstX) / sectionWidth))
+
+    // Clamp the index to valid range
+    index = max(0, min(index, faders.count - 1))
+
+    // Verify Y position is within the fader's bounds
+    let fader = faders[index]
+    if fader.frame.minY <= y && y <= fader.frame.maxY {
+        return fader.element
+    }
+
+    return nil
+}
+
 class ScrollWheelMonitor: Hashable {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private static var activeMonitors: Set<ScrollWheelMonitor> = []
     private let id = UUID()
     private let onScroll: (CGFloat, AXUIElement) -> Void
-
-    // Simplified cache structure
-    private struct CachedFader {
-        let element: AXUIElement
-        let frame: CGRect
-        let timestamp: Date
-    }
-    private var cachedFaders: [CachedFader] = []
-    private let cacheTimeout: TimeInterval = 2.0  // Increased timeout since we're caching more faders
+    private var cache: WindowedCache?
+    private var lastProcessedFader: AXUIElement?
 
     static func == (lhs: ScrollWheelMonitor, rhs: ScrollWheelMonitor) -> Bool {
         return lhs.id == rhs.id
@@ -231,8 +350,70 @@ class ScrollWheelMonitor: Hashable {
     }
 
     func invalidateCache() {
-        cachedFaders.removeAll()
-        print("Fader cache invalidated")
+        cache = nil
+        lastProcessedFader = nil
+    }
+
+    private func checkReferencePositionAndUpdateCache() {
+        guard let cache = cache,
+              !cache.visibleFaders.isEmpty else {
+            updateCacheIfNeeded()
+            return
+        }
+
+        // Get the current position of our reference fader (first fader)
+        let referenceFader = cache.visibleFaders[0].element
+        if let frame = getElementFrame(referenceFader) {
+            let currentPosition = CGPoint(x: frame.minX, y: frame.minY)
+
+            // If reference fader has moved significantly (e.g., more than 1 pixel)
+            if abs(currentPosition.x - cache.referenceFaderPosition.x) > 1.0 ||
+               abs(currentPosition.y - cache.referenceFaderPosition.y) > 1.0 {
+                print("Reference fader position changed - updating cache with new positions")
+
+                // Instead of just invalidating, immediately get new fader positions
+                let allFaders = getAllSortedFaders()
+                if !allFaders.isEmpty {
+                    // Create new cache with updated positions
+                    self.cache = WindowedCache(
+                        visibleFaders: allFaders,
+                        timestamp: Date(),
+                        referenceFaderPosition: CGPoint(x: allFaders[0].frame.minX, y: allFaders[0].frame.minY)
+                    )
+                } else {
+                    // If we couldn't get new faders, invalidate cache
+                    invalidateCache()
+                }
+            }
+        } else {
+            // If we can't get the frame of our reference fader, something's wrong
+            print("Could not get reference fader frame - invalidating cache")
+            invalidateCache()
+        }
+    }
+
+    private func updateCacheIfNeeded() {
+        if cache != nil {
+            checkReferencePositionAndUpdateCache()
+            return
+        }
+
+        let now = Date()
+
+        // Get all faders
+        let allFaders = getAllSortedFaders()
+
+        // If we have no faders, nothing to cache
+        guard !allFaders.isEmpty else { return }
+
+        // Store the position of our reference fader (first fader)
+        let referencePosition = CGPoint(x: allFaders[0].frame.minX, y: allFaders[0].frame.minY)
+
+        cache = WindowedCache(
+            visibleFaders: allFaders,
+            timestamp: now,
+            referenceFaderPosition: referencePosition
+        )
     }
 
     private func setupEventTap() {
@@ -252,79 +433,73 @@ class ScrollWheelMonitor: Hashable {
                     guard deltaY != 0.0 else { return Unmanaged.passRetained(event) }
 
                     let mouseLocation = NSEvent.mouseLocation
-                    guard let screen = NSScreen.screens.first else {
-                        monitor.invalidateCache()
+                    guard let screen = NSScreen.screens.first else { return Unmanaged.passRetained(event) }
+
+                    // Quick check if we're in Pro Tools and the Mix window
+                    let systemWideElement = AXUIElementCreateSystemWide()
+                    var element: AXUIElement?
+                    let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(mouseLocation.x), Float(mouseLocation.y), &element)
+
+                    guard result == .success,
+                          let element = element,
+                          let appElement = getApplicationElement(element) else {
                         return Unmanaged.passRetained(event)
                     }
-                    let point = CGPoint(x: mouseLocation.x, y: screen.frame.height - mouseLocation.y)
-                    let now = Date()
 
-                    // First check the cache
-                    if !monitor.cachedFaders.isEmpty {
-                        // Remove expired cache entries
-                        monitor.cachedFaders.removeAll {
-                            now.timeIntervalSince($0.timestamp) > monitor.cacheTimeout
-                        }
-
-                        // Check if mouse is over any cached fader
-                        if let cachedFader = monitor.cachedFaders.first(where: { $0.frame.contains(point) }) {
-                            // Verify the fader is still valid by checking its frame
-                            if let currentFrame = getElementFrame(cachedFader.element),
-                               currentFrame == cachedFader.frame {
-                                DispatchQueue.main.async {
-                                    monitor.onScroll(deltaY, cachedFader.element)
-                                }
-                                return nil // Consume event
-                            }
-                        }
+                    // Quick check for Pro Tools
+                    var appTitle: CFTypeRef?
+                    guard AXUIElementCopyAttributeValue(appElement, kAXTitleAttribute as CFString, &appTitle) == .success,
+                          let titleStr = appTitle as? String,
+                          titleStr == "Pro Tools" else {
+                        return Unmanaged.passRetained(event)
                     }
 
-                    // Direct lookup for element under mouse
-                    let systemWideElement = AXUIElementCreateSystemWide()
-                    var elementUnderMouse: AXUIElement?
-                    let result = AXUIElementCopyElementAtPosition(systemWideElement, Float(point.x), Float(point.y), &elementUnderMouse)
-
-                    if result == .success, let element = elementUnderMouse {
-                        // Check if element is a slider
+                    // Check if we're in a window
+                    var window: AXUIElement?
+                    var parent: AXUIElement? = element
+                    while let currentElement = parent {
                         var role: CFTypeRef?
-                        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
+                        if AXUIElementCopyAttributeValue(currentElement, kAXRoleAttribute as CFString, &role) == .success,
                            let roleStr = role as? String,
-                           roleStr == kAXSliderRole as String {
-                            // Found a slider directly!
-                            if let frame = getElementFrame(element) {
-                                // Add to cache
-                                monitor.cachedFaders.append(CachedFader(
-                                    element: element,
-                                    frame: frame,
-                                    timestamp: now
-                                ))
-                                DispatchQueue.main.async {
-                                    monitor.onScroll(deltaY, element)
-                                }
-                                return nil // Consume event
-                            }
+                           roleStr == kAXWindowRole as String {
+                            window = currentElement
+                            break
                         }
+                        parent = getParentElement(currentElement)
+                    }
 
-                        // If not a slider directly, do a quick search in nearby elements
-                        var nearbySliders: [AXUIElement] = []
-                        findAllSlidersRecursive(element, &nearbySliders, depth: 0, maxDepth: 3)
+                    // Verify Mix window
+                    guard let window = window else { return Unmanaged.passRetained(event) }
+                    var windowTitle: CFTypeRef?
+                    guard AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &windowTitle) == .success,
+                          let titleStr = windowTitle as? String,
+                          titleStr.hasPrefix("Mix:") else {
+                        return Unmanaged.passRetained(event)
+                    }
 
-                        for slider in nearbySliders {
-                            if let frame = getElementFrame(slider) {
-                                monitor.cachedFaders.append(CachedFader(
-                                    element: slider,
-                                    frame: frame,
-                                    timestamp: now
-                                ))
+                    let y = screen.frame.height - mouseLocation.y
 
-                                if frame.contains(point) {
-                                    DispatchQueue.main.async {
-                                        monitor.onScroll(deltaY, slider)
-                                    }
-                                    return nil // Consume event
-                                }
-                            }
+                    // Update cache if needed
+                    monitor.updateCacheIfNeeded()
+
+                    // Try to reuse last processed fader if we're still in the same position
+                    if let lastFader = monitor.lastProcessedFader,
+                       let frame = getElementFrame(lastFader),
+                       frame.contains(CGPoint(x: mouseLocation.x, y: y)) {
+                        DispatchQueue.main.async {
+                            monitor.onScroll(CGFloat(deltaY), lastFader)
                         }
+                        return nil
+                    }
+
+                    // Find new fader using cached faders
+                    if let cache = monitor.cache,
+                       let fader = findFaderAtPosition(mouseLocation.x, y, in: cache.visibleFaders) {
+                        monitor.lastProcessedFader = fader
+                        DispatchQueue.main.async {
+                            monitor.onScroll(CGFloat(deltaY), fader)
+                        }
+                        return nil
                     }
                 }
                 return Unmanaged.passRetained(event)
@@ -362,6 +537,11 @@ class ScrollWheelMonitor: Hashable {
             monitor.cleanup()
         }
         activeMonitors.removeAll()
+    }
+
+    // Make this public so it can be called from ContentView
+    func checkAndUpdateCache() {
+        checkReferencePositionAndUpdateCache()
     }
 }
 
@@ -422,34 +602,55 @@ func logSiblingsAndChildren(of element: AXUIElement) {
     }
 }
 
-// Recursive slider search with depth limit
-func findAllSlidersRecursive(_ element: AXUIElement, _ sliders: inout [AXUIElement], depth: Int, maxDepth: Int) {
-    if depth > maxDepth { return } // Stop recursion if too deep
+// // Recursive slider search with depth limit
+// func findAllSlidersRecursive(_ element: AXUIElement, _ sliders: inout [AXUIElement], depth: Int, maxDepth: Int) {
+//     if depth > maxDepth { return } // Stop recursion if too deep
 
-    var role: CFTypeRef?
-    if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
-       let roleStr = role as? String {
+//     var role: CFTypeRef?
+//     if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
+//        let roleStr = role as? String {
 
-        if roleStr == kAXSliderRole as String {
-            sliders.append(element)
-            // Don't search children of sliders themselves typically
-            return
+//         if roleStr == kAXSliderRole as String {
+//             sliders.append(element)
+//             // Don't search children of sliders themselves typically
+//             return
+//         }
+
+//         // Recurse into children regardless of parent type, but respect maxDepth
+//         var children: CFTypeRef?
+//         // Check if children attribute exists before trying to copy it
+//         var _: DarwinBoolean = false
+//         if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
+//            let childrenArray = children as? [AXUIElement] {
+//              // print("Depth \(depth): Element \(roleStr) has \(childrenArray.count) children. MaxDepth: \(maxDepth)") // Debug
+//             for child in childrenArray {
+//                 findAllSlidersRecursive(child, &sliders, depth: depth + 1, maxDepth: maxDepth)
+//             }
+//         }
+//          // else { print("Depth \(depth): Element \(roleStr) has no children or failed to get.")} // Debug
+//     }
+//     // else { print("Depth \(depth): Failed to get role for element.") } // Debug
+// }
+
+struct WindowedCache {
+    let visibleFaders: [FaderInfo]
+    let timestamp: Date
+    let referenceFaderPosition: CGPoint  // Store position of first fader as reference
+}
+
+// Helper function to find scroll area
+private func findScrollArea(fromElement: AXUIElement) -> AXUIElement? {
+    var current: AXUIElement? = fromElement
+    while let el = current {
+        var role: CFTypeRef?
+        if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &role) == .success,
+           let roleStr = role as? String,
+           roleStr == kAXScrollArea as String {
+            return el
         }
-
-        // Recurse into children regardless of parent type, but respect maxDepth
-        var children: CFTypeRef?
-        // Check if children attribute exists before trying to copy it
-        var _: DarwinBoolean = false
-        if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children) == .success,
-           let childrenArray = children as? [AXUIElement] {
-             // print("Depth \(depth): Element \(roleStr) has \(childrenArray.count) children. MaxDepth: \(maxDepth)") // Debug
-            for child in childrenArray {
-                findAllSlidersRecursive(child, &sliders, depth: depth + 1, maxDepth: maxDepth)
-            }
-        }
-         // else { print("Depth \(depth): Element \(roleStr) has no children or failed to get.")} // Debug
+        current = getParentElement(el)
     }
-    // else { print("Depth \(depth): Failed to get role for element.") } // Debug
+    return nil
 }
 
 #Preview {
